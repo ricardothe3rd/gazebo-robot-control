@@ -1,0 +1,15 @@
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# WebSocket support
+websockets>=12.0
+
+# ROS2 dependencies
+rclpy
+geometry-msgs
+nav-msgs
+tf-transformations
+
+# Utilities
+python-dotenv>=1.0.0
