@@ -8,42 +8,17 @@ from typing import Optional
 import json
 import logging
 
-# Import ROS2 bridge
-from ros2_bridge import ROS2Bridge
-
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Gazebo Robot Control")
 
-# ROS2 bridge instance
-ros2_bridge: Optional[ROS2Bridge] = None
-
 # Active WebSocket connections
 active_connections: list[WebSocket] = []
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize ROS2 bridge on startup."""
-    global ros2_bridge
-    try:
-        ros2_bridge = ROS2Bridge()
-        await ros2_bridge.start()
-        logger.info("ROS2 bridge started successfully")
-    except Exception as e:
-        logger.error(f"Failed to start ROS2 bridge: {e}")
-        ros2_bridge = None
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup ROS2 on shutdown."""
-    global ros2_bridge
-    if ros2_bridge:
-        await ros2_bridge.stop()
-        logger.info("ROS2 bridge stopped")
+# TODO: Add platform WebSocket client here to connect to developers.remake.ai
+# The robot runs locally with ROS2, this app relays commands through the platform
 
 
 @app.get("/health")
@@ -51,7 +26,6 @@ async def health_check():
     """Health check endpoint for platform."""
     return JSONResponse({
         "status": "ok",
-        "ros2_connected": ros2_bridge is not None and ros2_bridge.is_running(),
         "active_connections": len(active_connections)
     })
 
@@ -67,12 +41,12 @@ async def websocket_endpoint(websocket: WebSocket):
         # Send initial status
         await websocket.send_json({
             "type": "status",
-            "connected": ros2_bridge is not None and ros2_bridge.is_running()
+            "connected": True,
+            "message": "Connected to Gazebo Robot Control App"
         })
 
-        # Start listening to ROS2 pose updates
-        if ros2_bridge:
-            asyncio.create_task(forward_pose_updates(websocket))
+        # TODO: Connect to platform WebSocket client here
+        # Platform will relay commands to robot running locally with ROS2
 
         # Handle incoming messages
         while True:
@@ -96,32 +70,40 @@ async def websocket_endpoint(websocket: WebSocket):
 
 async def handle_command(command: dict, websocket: WebSocket):
     """Handle commands from browser."""
-    if not ros2_bridge or not ros2_bridge.is_running():
-        await websocket.send_json({
-            "type": "error",
-            "message": "ROS2 bridge not available"
-        })
-        return
-
     cmd_type = command.get("type")
-    logger.info(f"Received command: {cmd_type}")
+    logger.info(f"Received command: {cmd_type} - {command}")
+
+    # TODO: Send commands to platform WebSocket client, which will relay to robot
+    # For now, just acknowledge receipt
 
     try:
         if cmd_type == "move":
-            # Move command with linear_x and angular_z
             linear_x = command.get("linear_x", 0.0)
             angular_z = command.get("angular_z", 0.0)
-            await ros2_bridge.send_velocity(linear_x, angular_z)
+            logger.info(f"Move command: linear={linear_x}, angular={angular_z}")
+            await websocket.send_json({
+                "type": "command_received",
+                "command": cmd_type,
+                "message": f"Move command received (linear={linear_x}, angular={angular_z})"
+            })
 
         elif cmd_type == "stop":
-            # Stop robot
-            await ros2_bridge.send_velocity(0.0, 0.0)
+            logger.info("Stop command")
+            await websocket.send_json({
+                "type": "command_received",
+                "command": cmd_type,
+                "message": "Stop command received"
+            })
 
         elif cmd_type == "spin":
-            # Spin robot for duration
             angular_speed = command.get("angular_speed", 2.0)
             duration = command.get("duration", 5.0)
-            await ros2_bridge.spin_robot(angular_speed, duration)
+            logger.info(f"Spin command: speed={angular_speed}, duration={duration}")
+            await websocket.send_json({
+                "type": "command_received",
+                "command": cmd_type,
+                "message": f"Spin command received (speed={angular_speed}, duration={duration})"
+            })
 
         else:
             logger.warning(f"Unknown command type: {cmd_type}")
@@ -131,31 +113,15 @@ async def handle_command(command: dict, websocket: WebSocket):
             })
 
     except Exception as e:
-        logger.error(f"Error executing command: {e}")
+        logger.error(f"Error handling command: {e}")
         await websocket.send_json({
             "type": "error",
             "message": str(e)
         })
 
 
-async def forward_pose_updates(websocket: WebSocket):
-    """Forward robot pose updates from ROS2 to browser."""
-    if not ros2_bridge:
-        return
-
-    try:
-        while True:
-            pose = await ros2_bridge.get_current_pose()
-            if pose:
-                await websocket.send_json({
-                    "type": "pose_update",
-                    "x": pose["x"],
-                    "y": pose["y"],
-                    "yaw": pose["yaw"]
-                })
-            await asyncio.sleep(0.5)  # Update every 500ms
-    except Exception as e:
-        logger.error(f"Error forwarding pose updates: {e}")
+# TODO: Implement pose updates from platform WebSocket client
+# Robot will send pose data through platform, app will forward to browser
 
 
 # Mount static files (frontend)
