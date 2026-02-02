@@ -7,6 +7,7 @@ import uvicorn
 from typing import Optional
 import json
 import logging
+from platform_client import PlatformClient
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -17,8 +18,51 @@ app = FastAPI(title="Gazebo Robot Control")
 # Active WebSocket connections
 active_connections: list[WebSocket] = []
 
-# TODO: Add platform WebSocket client here to connect to developers.remake.ai
-# The robot runs locally with ROS2, this app relays commands through the platform
+# Platform client for robot communication
+platform_client: Optional[PlatformClient] = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize platform client on startup."""
+    global platform_client
+
+    # Get session credentials from environment
+    # These are provided by the platform when launching the app
+    session_id = os.getenv("SESSION_ID")
+    session_token = os.getenv("SESSION_TOKEN")
+    platform_url = os.getenv("PLATFORM_URL", "https://api.developers.remake.ai")
+
+    if session_id and session_token:
+        try:
+            platform_client = PlatformClient(session_id, session_token, platform_url)
+
+            # Register callbacks for robot data
+            platform_client.on_pose_update(handle_pose_update)
+            platform_client.on_laser_scan(handle_laser_scan)
+            platform_client.on_battery_update(handle_battery_update)
+
+            # Connect to platform
+            success = await platform_client.connect()
+            if success:
+                logger.info("✓ Platform client connected successfully")
+            else:
+                logger.error("✗ Platform client connection failed")
+                platform_client = None
+        except Exception as e:
+            logger.error(f"✗ Failed to initialize platform client: {e}")
+            platform_client = None
+    else:
+        logger.warning("⚠ No session credentials - running in standalone mode (no robot connection)")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    global platform_client
+    if platform_client:
+        await platform_client.disconnect()
+        logger.info("Platform client disconnected")
 
 
 @app.get("/health")
@@ -26,6 +70,7 @@ async def health_check():
     """Health check endpoint for platform."""
     return JSONResponse({
         "status": "ok",
+        "platform_connected": platform_client is not None and platform_client.is_connected(),
         "active_connections": len(active_connections)
     })
 
@@ -39,14 +84,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         # Send initial status
+        platform_connected = platform_client is not None and platform_client.is_connected()
         await websocket.send_json({
             "type": "status",
             "connected": True,
-            "message": "Connected to Gazebo Robot Control App"
+            "platform_connected": platform_connected,
+            "message": "Connected to app" + (" and robot" if platform_connected else " (robot offline)")
         })
-
-        # TODO: Connect to platform WebSocket client here
-        # Platform will relay commands to robot running locally with ROS2
 
         # Handle incoming messages
         while True:
@@ -69,41 +113,73 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 async def handle_command(command: dict, websocket: WebSocket):
-    """Handle commands from browser."""
-    cmd_type = command.get("type")
-    logger.info(f"Received command: {cmd_type} - {command}")
+    """Handle commands from browser and relay to robot via platform."""
+    if not platform_client or not platform_client.is_connected():
+        await websocket.send_json({
+            "type": "error",
+            "message": "Not connected to robot"
+        })
+        return
 
-    # TODO: Send commands to platform WebSocket client, which will relay to robot
-    # For now, just acknowledge receipt
+    cmd_type = command.get("type")
+    logger.info(f"Received command: {cmd_type}")
 
     try:
         if cmd_type == "move":
+            # Send twist command to robot via platform
             linear_x = command.get("linear_x", 0.0)
             angular_z = command.get("angular_z", 0.0)
-            logger.info(f"Move command: linear={linear_x}, angular={angular_z}")
-            await websocket.send_json({
-                "type": "command_received",
-                "command": cmd_type,
-                "message": f"Move command received (linear={linear_x}, angular={angular_z})"
-            })
+            success = await platform_client.send_twist_command(linear_x, angular_z)
+
+            if success:
+                await websocket.send_json({
+                    "type": "command_sent",
+                    "command": "move"
+                })
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Failed to send move command"
+                })
 
         elif cmd_type == "stop":
-            logger.info("Stop command")
-            await websocket.send_json({
-                "type": "command_received",
-                "command": cmd_type,
-                "message": "Stop command received"
-            })
+            # Send stop command to robot via platform
+            success = await platform_client.send_stop_command()
+
+            if success:
+                await websocket.send_json({
+                    "type": "command_sent",
+                    "command": "stop"
+                })
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Failed to send stop command"
+                })
 
         elif cmd_type == "spin":
+            # Spin is implemented as a timed angular velocity command
             angular_speed = command.get("angular_speed", 2.0)
             duration = command.get("duration", 5.0)
-            logger.info(f"Spin command: speed={angular_speed}, duration={duration}")
-            await websocket.send_json({
-                "type": "command_received",
-                "command": cmd_type,
-                "message": f"Spin command received (speed={angular_speed}, duration={duration})"
-            })
+
+            # Send angular velocity
+            success = await platform_client.send_twist_command(0.0, angular_speed)
+
+            if success:
+                await websocket.send_json({
+                    "type": "command_sent",
+                    "command": "spin",
+                    "duration": duration
+                })
+
+                # Stop after duration
+                await asyncio.sleep(duration)
+                await platform_client.send_stop_command()
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Failed to send spin command"
+                })
 
         else:
             logger.warning(f"Unknown command type: {cmd_type}")
@@ -120,8 +196,65 @@ async def handle_command(command: dict, websocket: WebSocket):
         })
 
 
-# TODO: Implement pose updates from platform WebSocket client
-# Robot will send pose data through platform, app will forward to browser
+async def handle_pose_update(data: dict):
+    """
+    Handle pose updates from robot via platform.
+    Forward to all connected browser clients.
+    """
+    message = {
+        "type": "pose_update",
+        "x": data.get("x", 0.0),
+        "y": data.get("y", 0.0),
+        "yaw": data.get("yaw", 0.0)
+    }
+
+    # Broadcast to all connected clients
+    for websocket in active_connections:
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            logger.error(f"Error sending pose update to client: {e}")
+
+
+async def handle_laser_scan(data: dict):
+    """
+    Handle laser scan data from robot via platform.
+    Forward to all connected browser clients.
+    """
+    message = {
+        "type": "laser_scan",
+        "ranges": data.get("ranges", []),
+        "angle_min": data.get("angle_min", -3.14),
+        "angle_max": data.get("angle_max", 3.14),
+        "angle_increment": data.get("angle_increment", 0.0175)
+    }
+
+    # Broadcast to all connected clients
+    for websocket in active_connections:
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            logger.error(f"Error sending laser scan to client: {e}")
+
+
+async def handle_battery_update(data: dict):
+    """
+    Handle battery updates from robot via platform.
+    Forward to all connected browser clients.
+    """
+    message = {
+        "type": "battery",
+        "percentage": data.get("percentage", 0),
+        "voltage": data.get("voltage", 0.0),
+        "charging": data.get("charging", False)
+    }
+
+    # Broadcast to all connected clients
+    for websocket in active_connections:
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            logger.error(f"Error sending battery update to client: {e}")
 
 
 # Mount static files (frontend)
