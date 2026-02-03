@@ -7,7 +7,7 @@ import uvicorn
 from typing import Optional
 import json
 import logging
-from platform_client import PlatformClient
+from .platform_client import PlatformClient
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
